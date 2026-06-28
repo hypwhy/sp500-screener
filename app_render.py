@@ -105,14 +105,15 @@ def update_data():
     tickers = get_sp500_tickers()
     today = datetime.datetime.today().strftime('%Y-%m-%d')
     
-    # 1. Fetch float shares for missing tickers using ThreadPool for speed
+    # 1. Fetch float shares for missing tickers using ThreadPool
     cursor = conn.execute("SELECT ticker FROM stock_info")
     info_tickers = set(row[0] for row in cursor.fetchall())
     missing_info = [t for t in tickers if t not in info_tickers]
     
     if missing_info:
         print(f"Fetching float shares for {len(missing_info)} tickers...")
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        # Reduced max_workers from 15 to 5 to save RAM on Render
+        with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(fetch_info, t): t for t in missing_info}
             for future in as_completed(futures):
                 t, f_shares = future.result()
@@ -128,13 +129,19 @@ def update_data():
     new_tickers = [t for t in tickers if t not in db_dates]
     existing_tickers = [t for t in tickers if t in db_dates]
     
-    # Download 3-year history for entirely new stocks
+    # HELPER: Chunk large lists to prevent Out-Of-Memory (OOM) crashes
+    def chunker(seq, size):
+        return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+
+    # Download 3-year history in chunks of 40 stocks
     if new_tickers:
         print(f"Downloading 3y historical data for {len(new_tickers)} new tickers...")
-        data_new = yf.download(new_tickers, period="3y", group_by="ticker", threads=True)
-        insert_yf_data(conn, data_new, new_tickers)
-        
-    # Download incremental delta for existing stocks
+        for chunk in chunker(new_tickers, 40):
+            print(f"Fetching chunk of {len(chunk)} stocks to save memory...")
+            data_new = yf.download(chunk, period="3y", group_by="ticker", threads=True)
+            insert_yf_data(conn, data_new, chunk)
+            
+    # Download incremental delta in chunks
     if existing_tickers:
         date_groups = {}
         for t in existing_tickers:
@@ -144,8 +151,9 @@ def update_data():
             start_date = (datetime.datetime.strptime(d, '%Y-%m-%d') + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
             if start_date <= today:
                 print(f"Downloading incremental data from {start_date} for {len(t_list)} tickers...")
-                data_inc = yf.download(t_list, start=start_date, group_by="ticker", threads=True)
-                insert_yf_data(conn, data_inc, t_list)
+                for chunk in chunker(t_list, 40):
+                    data_inc = yf.download(chunk, start=start_date, group_by="ticker", threads=True)
+                    insert_yf_data(conn, data_inc, chunk)
 
     # 3. Maintain sliding window (Delete data older than 36 months)
     three_years_ago = (datetime.datetime.today() - datetime.timedelta(days=3*365)).strftime('%Y-%m-%d')
