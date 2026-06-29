@@ -47,15 +47,16 @@ def init_db():
 # ---------------------------------------------------------
 def get_sp500_tickers():
     import requests
+    import io  # <-- NEW: Import the io library
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     
-    # CLOUD FIX 1: Wikipedia actively blocks AWS IPs that use generic browser user-agents.
-    # We must use a custom bot name to bypass their security on Render.
     headers = {'User-Agent': 'SP500ScreenerBot/1.0 (Educational Data Sync)'}
     response = requests.get(url, headers=headers)
-    response.raise_for_status() # Force an error if Wikipedia blocks us
+    response.raise_for_status() 
     
-    tables = pd.read_html(response.text)
+    # CLOUD FIX 4: Wrap the text in StringIO so Pandas doesn't think it's a file path
+    tables = pd.read_html(io.StringIO(response.text))
+    
     return [t.replace('.', '-') for t in tables[0]['Symbol'].tolist()]
 
 def fetch_info(t):
