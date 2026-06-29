@@ -6,9 +6,25 @@ import yfinance as yf
 from flask import Flask, request, jsonify, render_template_string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
+from zoneinfo import ZoneInfo
 
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# ... (your other imports)
+import requests
+
+# --- CLOUD FIX 5: FAKE BROWSER SESSION FOR YAHOO FINANCE ---
+# This tricks Yahoo into thinking we are a real human using Google Chrome
+yf_session = requests.Session()
+yf_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive'
+})
+# ------------------------------------------------------------
+
 
 app = Flask(__name__)
 DB_FILE = 'screener.db'
@@ -65,7 +81,8 @@ def get_sp500_tickers():
 
 def fetch_info(t):
     try:
-        info = yf.Ticker(t).info
+        # Pass the fake session here!
+        info = yf.Ticker(t, session=yf_session).info
         return t, info.get('floatShares') or info.get('sharesOutstanding')
     except:
         return t, None
@@ -106,7 +123,7 @@ def update_data():
     try:
         conn = get_db_connection()
         tickers = get_sp500_tickers()
-        today = datetime.datetime.today().strftime('%Y-%m-%d')
+        today = datetime.datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
         
         cursor = conn.execute("SELECT ticker FROM stock_info")
         info_tickers = set(row[0] for row in cursor.fetchall())
@@ -135,7 +152,7 @@ def update_data():
         # CLOUD FIX 2: Turned threads=False. Render's free CPU gets overwhelmed by yfinance multithreading.
         if new_tickers:
             for chunk in chunker(new_tickers, 30):
-                data_new = yf.download(chunk, period="3y", group_by="ticker", threads=False)
+                data_new = yf.download(chunk, period="3y", group_by="ticker", threads=False, session=yf_session)
                 insert_yf_data(conn, data_new, chunk)
                 
         if existing_tickers:
@@ -147,7 +164,7 @@ def update_data():
                 start_date = (datetime.datetime.strptime(d, '%Y-%m-%d') + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
                 if start_date <= today:
                     for chunk in chunker(t_list, 30):
-                        data_inc = yf.download(chunk, start=start_date, group_by="ticker", threads=False)
+                        data_inc = yf.download(chunk, start=start_date, group_by="ticker", threads=False, session=yf_session)
                         insert_yf_data(conn, data_inc, chunk)
 
         three_years_ago = (datetime.datetime.today() - datetime.timedelta(days=3*365)).strftime('%Y-%m-%d')
@@ -198,7 +215,9 @@ def screen():
                     'price_percentile': round(exact_pct, 2),
                     'volume_pct': round(vol_pct, 2)
                 })
-                
+    # Inside your screen() function
+    missing_floats = df_info[df_info['float_shares'].isna()]['ticker'].tolist()
+    print(f"Warning: Missing float shares for: {missing_floats}")            
     return jsonify(results)
 
 # ---------------------------------------------------------
