@@ -5,11 +5,10 @@ import pandas as pd
 import yfinance as yf
 from flask import Flask, request, jsonify, render_template_string
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 
-# --- ADD THESE TWO LINES TO FIX THE SSL ERROR ---
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
-# ------------------------------------------------
 
 app = Flask(__name__)
 DB_FILE = 'screener.db'
@@ -50,20 +49,18 @@ def get_sp500_tickers():
     import requests
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     
-    # Send a User-Agent header so Wikipedia thinks we are a standard web browser
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    # CLOUD FIX 1: Wikipedia actively blocks AWS IPs that use generic browser user-agents.
+    # We must use a custom bot name to bypass their security on Render.
+    headers = {'User-Agent': 'SP500ScreenerBot/1.0 (Educational Data Sync)'}
     response = requests.get(url, headers=headers)
+    response.raise_for_status() # Force an error if Wikipedia blocks us
     
-    # Read the HTML tables directly from the response text
     tables = pd.read_html(response.text)
-    
-    # Replace dots with dashes for yfinance (e.g., BRK.B -> BRK-B)
     return [t.replace('.', '-') for t in tables[0]['Symbol'].tolist()]
 
 def fetch_info(t):
     try:
         info = yf.Ticker(t).info
-        # Fallback to sharesOutstanding if floatShares is missing
         return t, info.get('floatShares') or info.get('sharesOutstanding')
     except:
         return t, None
@@ -101,66 +98,64 @@ def index():
 
 @app.route('/update', methods=['POST'])
 def update_data():
-    conn = get_db_connection()
-    tickers = get_sp500_tickers()
-    today = datetime.datetime.today().strftime('%Y-%m-%d')
-    
-    # 1. Fetch float shares for missing tickers using ThreadPool
-    cursor = conn.execute("SELECT ticker FROM stock_info")
-    info_tickers = set(row[0] for row in cursor.fetchall())
-    missing_info = [t for t in tickers if t not in info_tickers]
-    
-    if missing_info:
-        print(f"Fetching float shares for {len(missing_info)} tickers...")
-        # Reduced max_workers from 15 to 5 to save RAM on Render
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(fetch_info, t): t for t in missing_info}
-            for future in as_completed(futures):
-                t, f_shares = future.result()
-                if f_shares:
-                    conn.execute("INSERT OR IGNORE INTO stock_info (ticker, float_shares, last_updated) VALUES (?, ?, ?)", 
-                                 (t, f_shares, today))
+    try:
+        conn = get_db_connection()
+        tickers = get_sp500_tickers()
+        today = datetime.datetime.today().strftime('%Y-%m-%d')
+        
+        cursor = conn.execute("SELECT ticker FROM stock_info")
+        info_tickers = set(row[0] for row in cursor.fetchall())
+        missing_info = [t for t in tickers if t not in info_tickers]
+        
+        if missing_info:
+            print(f"Fetching float shares for {len(missing_info)} tickers...")
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(fetch_info, t): t for t in missing_info}
+                for future in as_completed(futures):
+                    t, f_shares = future.result()
+                    if f_shares:
+                        conn.execute("INSERT OR IGNORE INTO stock_info (ticker, float_shares, last_updated) VALUES (?, ?, ?)", 
+                                     (t, f_shares, today))
+            conn.commit()
+
+        cursor = conn.execute("SELECT ticker, MAX(date) FROM stock_data GROUP BY ticker")
+        db_dates = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        new_tickers = [t for t in tickers if t not in db_dates]
+        existing_tickers = [t for t in tickers if t in db_dates]
+        
+        def chunker(seq, size):
+            return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+
+        # CLOUD FIX 2: Turned threads=False. Render's free CPU gets overwhelmed by yfinance multithreading.
+        if new_tickers:
+            for chunk in chunker(new_tickers, 30):
+                data_new = yf.download(chunk, period="3y", group_by="ticker", threads=False)
+                insert_yf_data(conn, data_new, chunk)
+                
+        if existing_tickers:
+            date_groups = {}
+            for t in existing_tickers:
+                date_groups.setdefault(db_dates[t], []).append(t)
+                
+            for d, t_list in date_groups.items():
+                start_date = (datetime.datetime.strptime(d, '%Y-%m-%d') + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+                if start_date <= today:
+                    for chunk in chunker(t_list, 30):
+                        data_inc = yf.download(chunk, start=start_date, group_by="ticker", threads=False)
+                        insert_yf_data(conn, data_inc, chunk)
+
+        three_years_ago = (datetime.datetime.today() - datetime.timedelta(days=3*365)).strftime('%Y-%m-%d')
+        conn.execute("DELETE FROM stock_data WHERE date < ?", (three_years_ago,))
         conn.commit()
-
-    # 2. Identify missing vs existing dates for incremental download
-    cursor = conn.execute("SELECT ticker, MAX(date) FROM stock_data GROUP BY ticker")
-    db_dates = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        return jsonify({"status": "success", "message": "Data successfully updated."})
     
-    new_tickers = [t for t in tickers if t not in db_dates]
-    existing_tickers = [t for t in tickers if t in db_dates]
-    
-    # HELPER: Chunk large lists to prevent Out-Of-Memory (OOM) crashes
-    def chunker(seq, size):
-        return (seq[pos:pos + size] for pos in range(0, len(seq), size))
-
-    # Download 3-year history in chunks of 40 stocks
-    if new_tickers:
-        print(f"Downloading 3y historical data for {len(new_tickers)} new tickers...")
-        for chunk in chunker(new_tickers, 40):
-            print(f"Fetching chunk of {len(chunk)} stocks to save memory...")
-            data_new = yf.download(chunk, period="3y", group_by="ticker", threads=True)
-            insert_yf_data(conn, data_new, chunk)
-            
-    # Download incremental delta in chunks
-    if existing_tickers:
-        date_groups = {}
-        for t in existing_tickers:
-            date_groups.setdefault(db_dates[t], []).append(t)
-            
-        for d, t_list in date_groups.items():
-            start_date = (datetime.datetime.strptime(d, '%Y-%m-%d') + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
-            if start_date <= today:
-                print(f"Downloading incremental data from {start_date} for {len(t_list)} tickers...")
-                for chunk in chunker(t_list, 40):
-                    data_inc = yf.download(chunk, start=start_date, group_by="ticker", threads=True)
-                    insert_yf_data(conn, data_inc, chunk)
-
-    # 3. Maintain sliding window (Delete data older than 36 months)
-    three_years_ago = (datetime.datetime.today() - datetime.timedelta(days=3*365)).strftime('%Y-%m-%d')
-    conn.execute("DELETE FROM stock_data WHERE date < ?", (three_years_ago,))
-    conn.commit()
-    
-    return jsonify({"status": "success", "message": "Data successfully updated."})
+    except Exception as e:
+        # CLOUD FIX 3: If anything crashes, catch it and send the exact error to the browser
+        error_msg = traceback.format_exc()
+        print(error_msg)
+        return jsonify({"status": "error", "message": f"Crash Log:\n{str(e)}"})
 
 @app.route('/screen', methods=['POST'])
 def screen():
@@ -173,7 +168,6 @@ def screen():
     df_info = pd.read_sql('SELECT ticker, float_shares FROM stock_info', conn)
     float_map = dict(zip(df_info['ticker'], df_info['float_shares']))
     
-    # Load all cached data
     df = pd.read_sql('SELECT * FROM stock_data ORDER BY ticker, date', conn)
     results = []
     
@@ -191,7 +185,6 @@ def screen():
             vol_pct = (row['volume'] / float_shares) * 100
             
             if vol_pct > y and row['close'] <= percentile_threshold:
-                # Calculate exact percentile for transparency
                 exact_pct = (prices < row['close']).mean() * 100
                 results.append({
                     'ticker': ticker,
@@ -283,11 +276,16 @@ HTML_TEMPLATE = """
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('update-status').style.display = 'none';
-                    alert(data.message);
+                    if (data.status === 'error') {
+                        // CLOUD FIX 3: Display the exact Python error!
+                        alert("SERVER ERROR:\\n" + data.message);
+                    } else {
+                        alert(data.message);
+                    }
                 })
                 .catch(err => {
                     document.getElementById('update-status').style.display = 'none';
-                    alert('Error syncing data.');
+                    alert('Network error connecting to the server.');
                 });
         }
 
@@ -323,7 +321,6 @@ HTML_TEMPLATE = """
                             <td>${item.volume_pct}</td>
                         </tr>`;
                     });
-                    // Only show export button if there is actual data
                     document.getElementById('btn-export').style.display = 'block';
                 }
                 document.getElementById('results-card').style.display = 'block';
@@ -356,7 +353,6 @@ HTML_TEMPLATE = """
             rows.forEach(row => tbody.appendChild(row));
         }
 
-        // --- NEW CSV EXPORT LOGIC ---
         function exportTableToCSV(filename) {
             let csv = [];
             let rows = document.querySelectorAll("table tr");
@@ -365,15 +361,12 @@ HTML_TEMPLATE = """
                 let row = [], cols = rows[i].querySelectorAll("td, th");
                 
                 for (let j = 0; j < cols.length; j++) {
-                    // Grab the text and remove the sorting arrow symbol from the headers
                     let data = cols[j].innerText.replace('⇕', '').trim();
-                    // Wrap in quotes to handle any potential commas in the data cleanly
                     row.push('"' + data + '"');
                 }
                 csv.push(row.join(","));
             }
 
-            // Create the download link and trigger it
             let csvFile = new Blob([csv.join("\\n")], {type: "text/csv"});
             let downloadLink = document.createElement("a");
             downloadLink.download = filename;
@@ -390,7 +383,5 @@ HTML_TEMPLATE = """
 
 if __name__ == '__main__':
     init_db()
-    # Let the server assign the port (required for cloud hosting)
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
